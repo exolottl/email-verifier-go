@@ -3,9 +3,9 @@ module email-verify
 go 1.22.6
 
 require (
-	github.com/AfterShip/email-verifier v1.4.1 // indirect
-	github.com/hbollon/go-edlib v1.6.0 // indirect
-	github.com/tealeg/xlsx v1.0.5 // indirect
-	golang.org/x/net v0.29.0 // indirect
-	golang.org/x/text v0.18.0 // indirect
+	github.com/tealeg/xlsx v1.0.5
+	golang.org/x/net v0.30.0
+	golang.org/x/sync v0.8.0
 )
+
+require github.com/kr/pretty v0.2.1 // indirect

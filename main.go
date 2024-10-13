@@ -8,15 +8,40 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tealeg/xlsx"
+	"golang.org/x/net/context"
+	"golang.org/x/sync/semaphore"
 )
 
 type DomainCheck struct {
 	HasMX    bool
 	HasSPF   bool
 	HasDMARC bool
+}
+
+var (
+	dnsCache     = make(map[string]DomainCheck)
+	dnsCacheMutex sync.RWMutex
+	dnsResolver   *net.Resolver
+	sem           *semaphore.Weighted
+	verifiedCount int64
+	totalEmails   int64
+)
+
+func init() {
+	dnsResolver = &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := net.Dialer{
+				Timeout: time.Second * 10,
+			}
+			return d.DialContext(ctx, network, address)
+		},
+	}
+	sem = semaphore.NewWeighted(100) // Limit concurrent DNS lookups
 }
 
 func extractDomain(email string) string {
@@ -28,38 +53,62 @@ func extractDomain(email string) string {
 }
 
 func checkDomain(domain string) DomainCheck {
+	dnsCacheMutex.RLock()
+	if result, ok := dnsCache[domain]; ok {
+		dnsCacheMutex.RUnlock()
+		return result
+	}
+	dnsCacheMutex.RUnlock()
+
 	var result DomainCheck
+	var wg sync.WaitGroup
+	wg.Add(3)
 
-	mxRecords, err := net.LookupMX(domain)
-	if err == nil {
-		result.HasMX = len(mxRecords) > 0
-	} else {
-		log.Printf("Error checking MX records for domain %s: %v", domain, err)
-	}
+	go func() {
+		defer wg.Done()
+		sem.Acquire(context.Background(), 1)
+		defer sem.Release(1)
+		mxRecords, err := dnsResolver.LookupMX(context.Background(), domain)
+		if err == nil {
+			result.HasMX = len(mxRecords) > 0
+		}
+	}()
 
-	txtRecords, err := net.LookupTXT(domain)
-	if err == nil {
-		for _, record := range txtRecords {
-			if strings.HasPrefix(record, "v=spf1") {
-				result.HasSPF = true
-				break
+	go func() {
+		defer wg.Done()
+		sem.Acquire(context.Background(), 1)
+		defer sem.Release(1)
+		txtRecords, err := dnsResolver.LookupTXT(context.Background(), domain)
+		if err == nil {
+			for _, record := range txtRecords {
+				if strings.HasPrefix(record, "v=spf1") {
+					result.HasSPF = true
+					break
+				}
 			}
 		}
-	} else {
-		log.Printf("Error checking SPF records for domain %s: %v", domain, err)
-	}
+	}()
 
-	dmarcRecords, err := net.LookupTXT("_dmarc." + domain)
-	if err == nil {
-		for _, record := range dmarcRecords {
-			if strings.HasPrefix(record, "v=DMARC1") {
-				result.HasDMARC = true
-				break
+	go func() {
+		defer wg.Done()
+		sem.Acquire(context.Background(), 1)
+		defer sem.Release(1)
+		dmarcRecords, err := dnsResolver.LookupTXT(context.Background(), "_dmarc."+domain)
+		if err == nil {
+			for _, record := range dmarcRecords {
+				if strings.HasPrefix(record, "v=DMARC1") {
+					result.HasDMARC = true
+					break
+				}
 			}
 		}
-	} else {
-		log.Printf("Error checking DMARC records for domain %s: %v", domain, err)
-	}
+	}()
+
+	wg.Wait()
+
+	dnsCacheMutex.Lock()
+	dnsCache[domain] = result
+	dnsCacheMutex.Unlock()
 
 	return result
 }
@@ -67,55 +116,94 @@ func checkDomain(domain string) DomainCheck {
 func isEmailValid(email string) bool {
 	domain := extractDomain(email)
 	if domain == "" {
-		log.Printf("Invalid email format: %s", email)
 		return false
 	}
 
 	result := checkDomain(domain)
-	isValid := result.HasMX && result.HasSPF && result.HasDMARC
-
-	log.Printf("Email: %s, Valid: %t (MX: %t, SPF: %t, DMARC: %t)", email, isValid, result.HasMX, result.HasSPF, result.HasDMARC)
-	return isValid
+	return result.HasMX && result.HasSPF && result.HasDMARC
 }
 
-func processChunk(chunk [][]string, emailIndex int, chunkNum int, wg *sync.WaitGroup, resultChan chan<- [][]string) {
-	defer wg.Done()
-
-	start := time.Now() // Start measuring time for this chunk
-	log.Printf("Processing chunk %d with %d records", chunkNum, len(chunk))
-
-	for i := 0; i < len(chunk); i++ {
+func processChunk(chunk [][]string, emailIndex int, resultChan chan<- [][]string) {
+	for i := range chunk {
 		email := chunk[i][emailIndex]
 		if isEmailValid(email) {
 			chunk[i] = append(chunk[i], "verified")
-			log.Printf("Email %s verified", email)
+			atomic.AddInt64(&verifiedCount, 1)
 		} else {
 			chunk[i] = append(chunk[i], "unsafe")
-			log.Printf("Email %s marked unsafe", email)
+		}
+		atomic.AddInt64(&totalEmails, 1)
+		
+		// Log progress every 1000 emails
+		if atomic.LoadInt64(&totalEmails)%1000 == 0 {
+			log.Printf("Progress: %d emails processed, %d verified", atomic.LoadInt64(&totalEmails), atomic.LoadInt64(&verifiedCount))
 		}
 	}
-
-	// Measure the time taken to process this chunk
-	elapsed := time.Since(start)
-	log.Printf("Finished processing chunk %d, took %v", chunkNum, elapsed)
-
 	resultChan <- chunk
 }
 
-func processCSV(inputFile, outputFile string, chunkSize int) error {
+func processRecords(records [][]string, outputFile string, chunkSize int) error {
+	var emailIndex int
+	for i, header := range records[0] {
+		if strings.ToLower(header) == "email" {
+			emailIndex = i
+			break
+		}
+	}
 
-	// Open the input file
+	records[0] = append(records[0], "send_status")
+
+	resultChan := make(chan [][]string, 10)
+	var wg sync.WaitGroup
+
+	totalEmails = 0
+	verifiedCount = 0
+
+	for i := 1; i < len(records); i += chunkSize {
+		end := i + chunkSize
+		if end > len(records) {
+			end = len(records)
+		}
+
+		chunk := records[i:end]
+		wg.Add(1)
+		go func(chunk [][]string) {
+			defer wg.Done()
+			processChunk(chunk, emailIndex, resultChan)
+		}(chunk)
+	}
+
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	outFile, err := os.Create(outputFile)
+	if err != nil {
+		return err
+	}
+	defer outFile.Close()
+
+	writer := csv.NewWriter(bufio.NewWriter(outFile))
+	defer writer.Flush()
+
+	writer.Write(records[0])
+
+	for chunk := range resultChan {
+		writer.WriteAll(chunk)
+	}
+
+	return nil
+}
+
+func processCSV(inputFile, outputFile string, chunkSize int) error {
 	file, err := os.Open(inputFile)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
 
-	// Create a new CSV reader
-	bufferedReader := bufio.NewReader(file)
-	reader := csv.NewReader(bufferedReader)
-
-	// Read all records
+	reader := csv.NewReader(bufio.NewReader(file))
 	records, err := reader.ReadAll()
 	if err != nil {
 		return err
@@ -125,7 +213,6 @@ func processCSV(inputFile, outputFile string, chunkSize int) error {
 }
 
 func processXLSX(inputFile, outputFile string, chunkSize int) error {
-
 	xlFile, err := xlsx.OpenFile(inputFile)
 	if err != nil {
 		return err
@@ -133,7 +220,6 @@ func processXLSX(inputFile, outputFile string, chunkSize int) error {
 
 	var records [][]string
 
-	// Assuming data is in the first sheet
 	for _, sheet := range xlFile.Sheets {
 		for _, row := range sheet.Rows {
 			var record []string
@@ -148,77 +234,14 @@ func processXLSX(inputFile, outputFile string, chunkSize int) error {
 	return processRecords(records, outputFile, chunkSize)
 }
 
-func processRecords(records [][]string, outputFile string, chunkSize int) error {
-	// Find the index of the "email" column
-	var emailIndex int
-	for i, header := range records[0] {
-		if strings.ToLower(header) == "email" {
-			emailIndex = i
-			break
-		}
-	}
-
-	log.Printf("Email column found at index %d", emailIndex)
-
-	// Add a new header for the safety status
-	records[0] = append(records[0], "send_status")
-
-	// Create a channel to receive processed chunks
-	resultChan := make(chan [][]string, 10)
-	var wg sync.WaitGroup
-
-	// Process records in chunks
-	for i := 1; i < len(records); i += chunkSize {
-		end := i + chunkSize
-		if end > len(records) {
-			end = len(records)
-		}
-
-		chunk := records[i:end]
-		wg.Add(1)
-		chunkNum := i / chunkSize
-		go processChunk(chunk, emailIndex, chunkNum, &wg, resultChan)
-	}
-
-	go func() {
-		wg.Wait()
-		close(resultChan)
-	}()
-
-	// Create the output file
-	outFile, err := os.Create(outputFile)
-	if err != nil {
-		return err
-	}
-	defer outFile.Close()
-
-	// Create a new CSV writer
-	writer := csv.NewWriter(outFile)
-	defer writer.Flush()
-
-	// Write the header first
-	writer.Write(records[0])
-
-	// Write each processed chunk
-	for chunk := range resultChan {
-		for _, record := range chunk {
-			writer.Write(record)
-		}
-	}
-
-	// Measure the total time taken to process the file
-	elapsed := time.Since(time.Now())
-	log.Printf("Total processing time: %v", elapsed)
-
-	return nil
-}
-
 func main() {
-	inputFile := "6-8Lakh-Online-shoppers.xlsx" // Can be .csv or .xlsx
+	inputFile := "6-8Lakh-Online-shoppers.xlsx"
 	outputFile := strings.Split(inputFile, ".")[0] + "_verified.csv"
-	chunkSize := 500 // You can adjust the chunk size based on your needs
+	chunkSize := 1000
 
 	log.Println("Starting processing...")
+
+	start := time.Now()
 
 	var err error
 	if strings.HasSuffix(inputFile, ".csv") {
@@ -233,5 +256,7 @@ func main() {
 		log.Fatalf("Error processing file: %v", err)
 	}
 
-	log.Println("Processing completed. Results written to", outputFile)
+	elapsed := time.Since(start)
+	log.Printf("Processing completed in %s. Results written to %s", elapsed, outputFile)
+	log.Printf("Final count: %d emails processed, %d verified", atomic.LoadInt64(&totalEmails), atomic.LoadInt64(&verifiedCount))
 }
