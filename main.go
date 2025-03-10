@@ -207,6 +207,7 @@ func isEmailValid(email string) bool {
 }
 
 func processChunk(chunk [][]string, emailIndex int, resultChan chan<- [][]string) {
+	log.Printf("Starting chunk with %d records", len(chunk))
 	for i := range chunk {
 		email := chunk[i][emailIndex]
 		if isEmailValid(email) {
